@@ -1,0 +1,9 @@
+# Репозиторий хранит только скилл portfolio-case.
+*
+!/.gitignore
+!/.cursor/
+/.cursor/*
+!/.cursor/skills/
+/.cursor/skills/*
+!/.cursor/skills/portfolio-case/
+!/.cursor/skills/portfolio-case/**

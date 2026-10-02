@@ -1,4 +1,4 @@
-# Репозиторий хранит только скилл portfolio-case.
+# Репозиторий хранит скиллы portfolio-case и portfolio-case-video.
 *
 !/.gitignore
 !/README.md
@@ -8,3 +8,6 @@
 /.cursor/skills/*
 !/.cursor/skills/portfolio-case/
 !/.cursor/skills/portfolio-case/**
+!/.cursor/skills/portfolio-case-video/
+!/.cursor/skills/portfolio-case-video/**
+.cursor/skills/portfolio-case-video/node_modules/

@@ -497,7 +497,19 @@ async function settle(page) {
 async function ensureTour(page) {
   const has = await page.evaluate(() => !!(window.__tour && window.__tour.scan)).catch(() => false);
   if (!has) await page.evaluate(installTour, compact).catch(() => {});
-  await page.evaluate(() => window.__tour && window.__tour.mount()).catch(() => {});
+  await page.evaluate(() => {
+    window.__tour && window.__tour.mount();
+    if (window.__tourNoHash) return;
+    window.__tourNoHash = true;
+    document.addEventListener(
+      'click',
+      (e) => {
+        const a = e.target && e.target.closest && e.target.closest('a');
+        if (a && a.getAttribute('href') === '#') e.preventDefault();
+      },
+      true
+    );
+  }).catch(() => {});
 }
 
 async function pageFacts(page) {
@@ -617,12 +629,13 @@ async function unlockScroll(page) {
     .catch(() => {});
 }
 
-async function scrollSegment(page, dist) {
+async function scrollSegment(page, dist, pxPerSec = 700) {
   if (!dist) return;
   await unlockScroll(page);
-  const steps = Math.max(1, Math.round(Math.abs(dist) / 48));
+  const step = pxPerSec > 1500 ? 160 : 48;
+  const steps = Math.max(1, Math.round(Math.abs(dist) / step));
   const stepPx = dist / steps;
-  const dt = Math.max(16, (Math.abs(stepPx) / 700) * 1000);
+  const dt = Math.max(8, (Math.abs(stepPx) / pxPerSec) * 1000);
   let last = null;
   let stuck = 0;
   for (let i = 0; i < steps; i++) {
@@ -642,11 +655,20 @@ async function scrollSegment(page, dist) {
   }
 }
 
+async function holdScroll(page, y) {
+  for (let i = 0; i < 8; i++) {
+    const now = (await metrics(page)).scrollY;
+    if (Math.abs(now - y) > 80) await page.evaluate((yy) => window.scrollTo(0, yy), y).catch(() => {});
+    await sleep(100);
+  }
+}
+
 async function scrollToY(page, target) {
   const m = await metrics(page);
-  if (Math.abs(target - m.scrollY) < 8) return;
+  const dist = target - m.scrollY;
+  if (Math.abs(dist) < 8) return;
   await showCaption(page, 'Свайп');
-  await scrollSegment(page, target - m.scrollY);
+  await scrollSegment(page, dist, dist < 0 ? 3600 : 700);
   await clearCaption(page);
 }
 
@@ -697,27 +719,268 @@ async function opening(page, mobile) {
       } else await sleep(500);
     }
   });
-  await tryStep('наверх', async () => {
+}
+
+async function clickBackToTop(page) {
+  const found = (await scan(page)).toTop;
+  if (!found) return;
+  await clickAction(page, found.x, found.y, false);
+  await page.waitForFunction(() => window.scrollY < 90, { timeout: 1600 }).catch(() => {});
+  const y = await page.evaluate(() => window.scrollY).catch(() => 0);
+  if (y > 140) await scrollToY(page, 0);
+}
+
+async function lookStage(page, seen, want) {
+  return page.evaluate((seen, want) => {
+    const seenSet = new Set(seen || []);
+    const sliderRe = /slider|swiper|slick|splide|owl-carousel|carousel|dragscroll/i;
+    const nextRe = /swiper-button-next|slick-next|splide__arrow--next|owl-next|slider__next|slider-next|carousel__next|arrow--next|arrow-next/i;
+    const popupRe = /смотреть|галере|lightbox|fancybox|photoswipe|glightbox|увеличить/i;
+    const skipBlob = /cookie|consent|mw-modal|mw-overlay/i;
+
+    const visible = (el) => {
+      if (!el || (el.closest && el.closest('#__tour-root'))) return null;
+      const s = getComputedStyle(el);
+      if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return null;
+      const r = el.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) return null;
+      if (r.bottom < 8 || r.top > innerHeight - 8 || r.right < 0 || r.left > innerWidth) return null;
+      return r;
+    };
+    const point = (r) => ({
+      x: Math.round(Math.min(innerWidth - 8, Math.max(8, r.left + r.width / 2))),
+      y: Math.round(Math.min(innerHeight - 8, Math.max(8, r.top + r.height / 2)))
+    });
+    const keyOf = (el) => {
+      const top = Math.round(el.getBoundingClientRect().top + window.scrollY);
+      return (String(el.className).slice(0, 80) || el.tagName) + '@' + top;
+    };
+
+    if (want.slider) {
+      for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+        const r = visible(el);
+        if (!r || r.width > 88 || r.height > 88 || r.top < 70) continue;
+        const label = (el.getAttribute('aria-label') || el.innerText || '').replace(/\s+/g, ' ').trim();
+        const blob = [el.className, label].join(' ');
+        if (!nextRe.test(blob) && !/^(next|след\.?|вперёд|вперед)$/i.test(label)) continue;
+        const host = el.closest('[class*="slider"], [class*="swiper"], [class*="carousel"], [class*="slick"], [class*="splide"]') || el.parentElement;
+        const key = 'next:' + keyOf(host || el);
+        if (seenSet.has(key)) continue;
+        return { kind: 'next', key, ...point(r) };
+      }
+
+      let best = null;
+      let bestEl = null;
+      let bestOverflow = 120;
+      for (const el of document.querySelectorAll('div, ul, section')) {
+        const blob = String(el.className || '');
+        if (!sliderRe.test(blob) || skipBlob.test(blob)) continue;
+        const r = visible(el);
+        if (!r || r.width < 260 || r.height < 120 || r.height > innerHeight * 1.4) continue;
+        const visibleH = Math.min(r.bottom, innerHeight - 8) - Math.max(r.top, 8);
+        if (visibleH < 140) continue;
+        if (r.top > innerHeight * 0.72 || r.bottom < innerHeight * 0.28) continue;
+        const overflow = el.scrollWidth - el.clientWidth;
+        if (overflow < bestOverflow) continue;
+        const key = 'slider:' + keyOf(el);
+        if (seenSet.has(key)) continue;
+        bestOverflow = overflow;
+        const startX = Math.round(Math.min(innerWidth - 36, Math.max(36, r.right - 90)));
+        bestEl = el;
+        best = {
+          kind: 'slider',
+          key,
+          x: startX,
+          y: Math.round(Math.min(innerHeight - 24, Math.max(24, r.top + r.height / 2))),
+          dx: Math.round(Math.min(520, Math.max(220, r.width * 0.34)))
+        };
+      }
+      if (bestEl) {
+        document.querySelectorAll('[data-tour-nudge]').forEach((el) => el.removeAttribute('data-tour-nudge'));
+        bestEl.setAttribute('data-tour-nudge', '1');
+      }
+      if (best) return best;
+    }
+
+    if (want.popup) {
+      for (const el of document.querySelectorAll('a, button, [role="button"]')) {
+        if (el.closest && el.closest('#__tour-root')) continue;
+        const s = getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8 || r.height > 120 || r.width > innerWidth * 0.55) continue;
+        if (r.right < 8 || r.left > innerWidth - 8) continue;
+        const inBand = r.top > 70 && r.top < innerHeight + 460;
+        if (!inBand) continue;
+        const href = el.getAttribute('href') || '';
+        let leaves = false;
+        try {
+          if (el.tagName === 'A' && href && !href.startsWith('#')) {
+            const path = new URL(href, location.href).pathname.replace(/\/+$/, '') || '/';
+            const here = location.pathname.replace(/\/+$/, '') || '/';
+            leaves = path !== here;
+          }
+        } catch (e) {
+          leaves = false;
+        }
+        if (leaves) continue;
+        const blob = [
+          el.className,
+          el.getAttribute('data-fancybox'),
+          el.getAttribute('data-lightbox'),
+          el.getAttribute('data-gallery'),
+          el.getAttribute('aria-label'),
+          (el.innerText || '').slice(0, 40)
+        ].join(' ');
+        if (skipBlob.test(blob) || /меню|cookie|понятно/i.test(blob)) continue;
+        const fancy = el.hasAttribute('data-fancybox') || el.hasAttribute('data-lightbox') || el.hasAttribute('data-gallery');
+        if (!fancy && !popupRe.test(blob)) continue;
+        const key = 'popup:' + keyOf(el);
+        if (seenSet.has(key)) continue;
+        const lift = Math.max(0, Math.round(r.bottom - (innerHeight - 190)));
+        return { kind: 'popup', key, lift, ...point(r) };
+      }
+    }
+    return null;
+  }, seen, want);
+}
+
+async function nudgeSlider(page, stage) {
+  for (let n = 0; n < 2; n++) {
+    const from = await page.evaluate(() => {
+      const el = document.querySelector('[data-tour-nudge]');
+      return el ? el.scrollLeft : 0;
+    });
+    await glide(page, stage.x, stage.y, 280);
     await showCaption(page, 'Свайп');
-    let found = null;
-    for (let i = 0; i < 4 && !found; i++) {
-      found = (await scan(page)).toTop;
-      if (found) break;
-      const m = await metrics(page);
-      await scrollSegment(page, Math.round(m.innerHeight * 0.75));
-      await sleep(220);
+    await page.mouse.down().catch(() => {});
+    const steps = 8;
+    for (let i = 1; i <= steps; i++) {
+      const cx = stage.x - (stage.dx * i) / steps;
+      cursor = { x: cx, y: stage.y };
+      await page.mouse.move(cx, stage.y).catch(() => {});
+      await page.evaluate((px, py) => window.__tour && window.__tour.move(px, py), cx, stage.y).catch(() => {});
+      await sleep(36);
     }
+    await page.mouse.up().catch(() => {});
+    await sleep(220);
+    await page.evaluate((dx, start) => {
+      const el = document.querySelector('[data-tour-nudge]');
+      if (el && el.scrollLeft < start + dx * 0.35) el.scrollLeft = start + dx;
+    }, stage.dx, from);
+    await sleep(280);
     await clearCaption(page);
-    if (found) {
-      await sleep(300);
-      await clickAction(page, found.x, found.y, false);
-      await page.waitForFunction(() => window.scrollY < 90, { timeout: 2200 }).catch(() => {});
-      const y = await page.evaluate(() => window.scrollY).catch(() => 999);
-      if (y > 90) await scrollToY(page, 0);
-    } else {
-      await scrollToY(page, 0);
+  }
+  await page.keyboard.press('Escape').catch(() => {});
+}
+
+async function overlayControls(page) {
+  return page.evaluate(() => {
+    const point = (el) => {
+      const r = el.getBoundingClientRect();
+      return {
+        x: Math.round(Math.min(innerWidth - 8, Math.max(8, r.left + r.width / 2))),
+        y: Math.round(Math.min(innerHeight - 8, Math.max(8, r.top + r.height / 2)))
+      };
+    };
+    const dialogs = [...document.querySelectorAll('[role="dialog"], .ui-dialog, .fancybox-container, .pswp, .glightbox-container')]
+      .filter((el) => {
+        if (el.closest && el.closest('#__tour-root')) return false;
+        const blob = String(el.className || '') + ' ' + (el.getAttribute('aria-label') || '');
+        if (/cookie|mw-overlay|mw-modal/i.test(blob)) return false;
+        const s = getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
+        return r.width > innerWidth * 0.35 && r.height > innerHeight * 0.35;
+      });
+    const dialog = dialogs[dialogs.length - 1];
+    if (!dialog) return null;
+    let close = null;
+    let next = null;
+    for (const el of dialog.querySelectorAll('button, a, [role="button"]')) {
+      const s = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      if (s.display === 'none' || r.width < 8 || r.height < 8) continue;
+      if (r.bottom < 0 || r.top > innerHeight) continue;
+      const blob = [el.className, el.getAttribute('aria-label') || '', el.getAttribute('title') || '', (el.innerText || '').slice(0, 24)].join(' ');
+      if (!close && /close|закрыть|closethick|✕|×/i.test(blob)) close = point(el);
+      if (!next && /next|след|arrow-right|вперёд|вперед/i.test(blob)) next = point(el);
     }
+    return { close, next };
   });
+}
+
+async function openPopup(page, stage) {
+  const back = page.url();
+  if (stage.lift > 12) {
+    await scrollSegment(page, stage.lift);
+    const fresh = await lookStage(page, [], { slider: false, popup: true }).catch(() => null);
+    if (fresh && fresh.kind === 'popup') {
+      stage.x = fresh.x;
+      stage.y = fresh.y;
+    } else {
+      stage.y = Math.max(48, stage.y - stage.lift);
+    }
+  }
+  const yBefore = (await metrics(page)).scrollY;
+  await clickAction(page, stage.x, stage.y, false);
+  await holdScroll(page, yBefore);
+  await sleep(400);
+  if (norm(page.url()) !== norm(back)) {
+    await page.goBack({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    await ensureTour(page);
+    return;
+  }
+  let controls = null;
+  for (let i = 0; i < 3 && !controls; i++) {
+    controls = await overlayControls(page);
+    if (!controls) await sleep(250);
+  }
+  if (controls) {
+    for (let i = 0; i < 2 && controls.next; i++) {
+      await clickAction(page, controls.next.x, controls.next.y, false);
+      await sleep(450);
+      controls = (await overlayControls(page)) || controls;
+    }
+    await sleep(500);
+    if (controls.close) await clickAction(page, controls.close.x, controls.close.y, false);
+    else await page.keyboard.press('Escape').catch(() => {});
+    await holdScroll(page, yBefore);
+  } else {
+    await page.keyboard.press('Escape').catch(() => {});
+  }
+  await sleep(250);
+  await ensureTour(page);
+}
+
+async function showStages(page, seen, budget) {
+  const want = { slider: budget.sliders > 0, popup: budget.popups > 0 };
+  if (!want.slider && !want.popup) return budget;
+  const stage = await lookStage(page, seen, want).catch(() => null);
+  if (!stage || seen.includes(stage.key)) return budget;
+  seen.push(stage.key);
+  await clearCaption(page);
+  if (stage.kind === 'popup') {
+    budget.popups -= 1;
+    await openPopup(page, stage);
+  } else if (stage.kind === 'next') {
+    budget.sliders -= 1;
+    await clickAction(page, stage.x, stage.y, false);
+    await sleep(420);
+    await clickAction(page, stage.x, stage.y, false);
+  } else {
+    budget.sliders -= 1;
+    if (budget.popups > 0) {
+      const popup = await lookStage(page, seen, { slider: false, popup: true }).catch(() => null);
+      if (popup && !seen.includes(popup.key)) {
+        seen.push(popup.key);
+        budget.popups -= 1;
+        await openPopup(page, popup);
+      }
+    }
+    await nudgeSlider(page, stage);
+  }
+  return budget;
 }
 
 function capY(m, item, mobile) {
@@ -733,6 +996,8 @@ async function scrollItem(page, item, mobile) {
   let screens = 0;
   let hovers = 0;
   const used = new Set();
+  const seenStages = [];
+  const stageBudget = { sliders: 2, popups: 1 };
   const hoverBudget = mobile ? 0 : item.type === 'catalog' ? 3 : 4;
   await showCaption(page, 'Свайп');
   while (true) {
@@ -750,6 +1015,10 @@ async function scrollItem(page, item, mobile) {
     const after = await page.evaluate(() => window.scrollY).catch(() => before);
     if (after < before + 8) break;
     screens += dist / m.innerHeight;
+    if (stageBudget.sliders > 0 || stageBudget.popups > 0) {
+      await showStages(page, seenStages, stageBudget);
+      await showCaption(page, 'Свайп');
+    }
     if (hovers < hoverBudget) {
       await clearCaption(page);
       const h = ((await scan(page)).hovers || []).find((el) => el && el.key && !used.has(el.key));
@@ -899,6 +1168,101 @@ async function clickCard(page, href) {
   return { via: 'card', url: page.url(), href: card.href };
 }
 
+async function choicePlan(page) {
+  return page.evaluate(() => {
+    const groups = new Map();
+    for (const input of document.querySelectorAll('input[type="radio"]')) {
+      if (input.closest && input.closest('#__tour-root')) continue;
+      const name = input.name || '';
+      if (!name) continue;
+      const label = input.id
+        ? document.querySelector('label[for="' + CSS.escape(input.id) + '"]')
+        : input.closest('label');
+      const el = label || input;
+      const s = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      if (s.display === 'none' || s.visibility === 'hidden' || r.width < 8 || r.height < 8) continue;
+      const text = (el.innerText || input.value || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+      if (!groups.has(name)) groups.set(name, []);
+      groups.get(name).push({
+        text,
+        checked: !!input.checked,
+        x: Math.round(Math.min(innerWidth - 8, Math.max(8, r.left + r.width / 2))),
+        y: Math.round(r.top + window.scrollY + r.height / 2)
+      });
+    }
+    const picks = [];
+    for (const [name, items] of groups) {
+      if (items.length < 2) continue;
+      const alt = items.find((it) => !it.checked) || items[1];
+      if (!alt) continue;
+      picks.push({ name, ...alt });
+      if (picks.length >= 4) break;
+    }
+    let next = null;
+    for (const el of document.querySelectorAll('button, a, input[type="button"], input[type="submit"]')) {
+      const t = (el.innerText || el.value || '').replace(/\s+/g, ' ').trim();
+      if (!/^далее$|^next$/i.test(t)) continue;
+      if (/отправ|расч[её]т|заказ/i.test(t)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) continue;
+      next = {
+        x: Math.round(Math.min(innerWidth - 8, Math.max(8, r.left + r.width / 2))),
+        y: Math.round(r.top + window.scrollY + r.height / 2)
+      };
+      break;
+    }
+    const count = [...groups.values()].reduce((n, g) => n + g.length, 0);
+    return { picks, next, count };
+  });
+}
+
+async function clickDocPoint(page, docX, docY) {
+  const m = await metrics(page);
+  const target = Math.max(0, docY - m.innerHeight * 0.38);
+  if (Math.abs(target - m.scrollY) > 36) await scrollToY(page, target);
+  const now = await metrics(page);
+  const y = docY - now.scrollY;
+  if (y < 36 || y > now.innerHeight - 28) return false;
+  await clickAction(page, docX, y, false);
+  await sleep(650);
+  return true;
+}
+
+async function demoChoices(page) {
+  const used = new Set();
+  let next = null;
+  for (let i = 0; i < 4; i++) {
+    const plan = await choicePlan(page).catch(() => null);
+    if (!plan || plan.count < 6) return;
+    next = plan.next || next;
+    const pick = (plan.picks || []).find((p) => p && p.name && !used.has(p.name));
+    if (!pick) break;
+    used.add(pick.name);
+    await clickDocPoint(page, pick.x, pick.y);
+  }
+  if (used.size < 2 || !next) return;
+  const opened = await clickDocPoint(page, next.x, next.y);
+  if (!opened) return;
+  await sleep(900);
+  const back = await page.evaluate(() => {
+    const el = [...document.querySelectorAll('button, a')].find((n) =>
+      /^назад$|^back$/i.test((n.innerText || '').replace(/\s+/g, ' ').trim())
+    );
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8 || r.top < 0 || r.bottom > innerHeight) return null;
+    return {
+      x: Math.round(Math.min(innerWidth - 8, Math.max(8, r.left + r.width / 2))),
+      y: Math.round(Math.min(innerHeight - 8, Math.max(8, r.top + r.height / 2)))
+    };
+  });
+  if (back) {
+    await clickAction(page, back.x, back.y, false);
+    await sleep(400);
+  }
+}
+
 async function play(page, route, mobile) {
   for (const item of route.pages) {
     console.error('— ' + item.type + '  ' + item.url);
@@ -936,7 +1300,9 @@ async function playItem(page, item, mobile) {
     await resetCursor(page);
     if (item.type === 'home') await opening(page, mobile);
     await sleep(item.type === 'home' ? 1100 : 1400);
+    if (item.type !== 'home') await demoChoices(page);
     await scrollItem(page, item, mobile);
+    if (item.type === 'home') await clickBackToTop(page);
     item.opened = page.url();
     item.title = await page.title().catch(() => item.title || '');
 }
@@ -1292,9 +1658,15 @@ function manualRoute(raw, startUrl) {
     console.error('Пустой --pages');
     process.exit(1);
   }
-  const pages = list.slice(0, 6).map((href, i) => {
+  const pages = list.slice(0, 8).map((href, i) => {
     const abs = new URL(href, startUrl).href;
-    const type = i === 0 ? 'home' : (classify(abs) || {}).type || 'page';
+    let type = i === 0 ? 'home' : (classify(abs) || {}).type || 'page';
+    try {
+      const depth = new URL(abs).pathname.split('/').filter(Boolean).length;
+      if (type === 'catalog' && depth > 1) type = 'page';
+    } catch (e) {
+      /* адрес без пути остаётся как есть */
+    }
     return {
       type,
       url: abs,
@@ -1304,7 +1676,7 @@ function manualRoute(raw, startUrl) {
       scroll: scrollPlan(type === 'page' ? 'service' : type)
     };
   });
-  if (list.length > 6) console.error('В --pages больше шести адресов, лишние не снимаю.');
+  if (list.length > 8) console.error('В --pages больше восьми адресов, лишние не снимаю.');
   return { url: startUrl, domain: domainOf(startUrl), pages };
 }
 
